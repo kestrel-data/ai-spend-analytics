@@ -1,0 +1,12 @@
+name: ai_spend
+version: "1.0.0"
+profile: ai_spend
+model-paths: ["models"]
+macro-paths: ["macros"]
+models:
+  ai_spend:
+    +materialized: table
+    staging:
+      +schema: staging
+    marts:
+      +schema: marts

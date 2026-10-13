@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+*.json.key
