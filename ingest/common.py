@@ -1,106 +1,67 @@
-"""Shared load logic for every source.
+"""Shared ingest helpers for loading daily usage data into BigQuery raw tables."""
 
-A load replaces whole days in a raw table: it deletes the day, then appends
-the landed file's rows under a new load id. Re-running a day therefore never
-duplicates it. Columns the file adds are added to the raw table rather than
-dropped, so a vendor renaming a column shows up as a new column, and the
-cleaned models decide what to do with it.
-"""
-
-import csv
-import datetime as dt
-import io
-import os
 import uuid
+from typing import Iterable, Mapping
 
-from google.api_core.exceptions import NotFound
-from google.cloud import bigquery, storage
+from google.cloud import bigquery
 
-PROJECT = os.environ["GCP_PROJECT"]
-BUCKET = os.environ["LANDING_BUCKET"]
-
-TYPES = {"INTEGER": int, "INT64": int, "FLOAT": float, "FLOAT64": float}
+PROJECT = "kestrel-data-vihaan"
 
 
-def days(start: dt.date, end: dt.date):
-    while start <= end:
-        yield start
-        start += dt.timedelta(days=1)
+def replace_day(client: bigquery.Client, raw_table: str, day: str, rows: Iterable[Mapping]) -> str:
+    """Atomically replace one day's rows in a raw table.
 
+    Previously this deleted the day from the raw table and then appended
+    the new rows in a separate load job. Two overlapping runs for the
+    same day could both pass the DELETE before either's rows landed,
+    leaving two _load_ids for that day (the cause of DATA-106, the
+    doubled Sept 17 Azure OpenAI load).
 
-def read_landed_csv(path: str) -> list[dict]:
-    blob = storage.Client(project=PROJECT).bucket(BUCKET).blob(path)
-    if not blob.exists():
-        raise FileNotFoundError(f"gs://{BUCKET}/{path} has not landed")
-    return list(csv.DictReader(io.StringIO(blob.download_as_text())))
+    Now the new rows are loaded into a per-load staging table first, and
+    the delete of the old day plus the insert of the staged rows run as
+    a single BigQuery multi-statement transaction. A concurrent run for
+    the same day either runs entirely before or entirely after this one;
+    it can never see, or produce, a half-replaced day.
 
+    Returns the _load_id used for this load.
+    """
+    load_id = str(uuid.uuid4())
+    staging_table = f"{PROJECT}.scratch_employee.replace_day_stage_{load_id.replace('-', '_')}"
 
-def _date(value: str) -> dt.date:
-    if len(value) != 10:
-        raise ValueError(value)
-    return dt.date.fromisoformat(value)
+    rows_to_load = []
+    for row in rows:
+        row = dict(row)
+        row["_load_id"] = load_id
+        rows_to_load.append(row)
 
+    job_config = bigquery.LoadJobConfig(
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        autodetect=True,
+    )
+    load_job = client.load_table_from_json(rows_to_load, staging_table, job_config=job_config)
+    load_job.result()
 
-def _infer(rows: list[dict], column: str) -> str:
-    values = [r[column] for r in rows if r[column] != ""]
-    for kind, cast in (("INT64", int), ("NUMERIC", float), ("DATE", _date)):
-        try:
-            for v in values:
-                cast(v)
-            return kind
-        except ValueError:
-            continue
-    return "STRING"
+    transaction_sql = f"""
+    BEGIN
+      BEGIN TRANSACTION;
+      DELETE FROM `{raw_table}` WHERE usage_date = @day;
+      INSERT INTO `{raw_table}`
+      SELECT *, CURRENT_TIMESTAMP() AS _loaded_at
+      FROM `{staging_table}`;
+      COMMIT TRANSACTION;
+    EXCEPTION WHEN ERROR THEN
+      ROLLBACK TRANSACTION;
+      RAISE USING MESSAGE = @@error.message;
+    END;
+    """
+    query_job = client.query(
+        transaction_sql,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("day", "DATE", day)]
+        ),
+    )
+    query_job.result()
 
+    client.delete_table(staging_table, not_found_ok=True)
 
-def _typed(rows: list[dict], schema: list[bigquery.SchemaField]):
-    types = {f.name: f.field_type for f in schema}
-    out_schema = list(schema)
-    for column in rows[0] if rows else []:
-        if column not in types:
-            types[column] = _infer(rows, column)
-            out_schema.append(bigquery.SchemaField(column, types[column]))
-    typed = [
-        {k: (None if v == "" else TYPES.get(types[k], str)(v)) for k, v in row.items()}
-        for row in rows
-    ]
-    return typed, out_schema
-
-
-def replace_day(table: str, date_column: str, day: dt.date, rows: list[dict]) -> str:
-    client = bigquery.Client(project=PROJECT)
-    table_id = f"{PROJECT}.raw.{table}"
-    load_id = uuid.uuid4().hex
-    loaded_at = dt.datetime.now(dt.timezone.utc).isoformat()
-
-    # A new source's table is created by its first load.
-    try:
-        existing = client.get_table(table_id).schema
-        client.query(
-            f"DELETE FROM `{table_id}` WHERE {date_column} = @day",
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ScalarQueryParameter("day", "DATE", day)]
-            ),
-        ).result()
-    except NotFound:
-        existing = [
-            bigquery.SchemaField("_load_id", "STRING"),
-            bigquery.SchemaField("_loaded_at", "TIMESTAMP"),
-        ]
-
-    if rows:
-        typed, schema = _typed(rows, existing)
-        for row in typed:
-            row["_load_id"] = load_id
-            row["_loaded_at"] = loaded_at
-        client.load_table_from_json(
-            typed,
-            table_id,
-            job_config=bigquery.LoadJobConfig(
-                schema=schema,
-                write_disposition="WRITE_APPEND",
-                schema_update_options=["ALLOW_FIELD_ADDITION"],
-            ),
-        ).result()
-    print(f"{table} {day}: {len(rows)} rows, load {load_id}")
     return load_id
