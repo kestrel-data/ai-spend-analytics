@@ -1,24 +1,19 @@
 """Shared load logic for every source.
 
-A load replaces whole days in a raw table: it loads the file's rows into a
-throwaway table, then swaps them into the day with one atomic multi-statement
-transaction (delete the day, insert the new rows, commit). Two loads for the
-same day can therefore never both land: whichever transaction commits second
-sees the first one's rows, deletes them, and inserts only its own. Columns
-the file adds are added to the raw table rather than dropped, so a vendor
-renaming a column shows up as a new column, and the cleaned models decide
-what to do with it.
+A load replaces whole days in a raw table: it deletes the day, then appends
+the landed file's rows under a new load id. Re-running a day therefore never
+duplicates it. Columns the file adds are added to the raw table rather than
+dropped, so a vendor renaming a column shows up as a new column, and the
+cleaned models decide what to do with it.
 """
 
 import csv
 import datetime as dt
 import io
 import os
-import random
-import time
 import uuid
 
-from google.api_core.exceptions import Conflict, NotFound
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery, storage
 
 PROJECT = os.environ["GCP_PROJECT"]
@@ -72,55 +67,32 @@ def _typed(rows: list[dict], schema: list[bigquery.SchemaField]):
     return typed, out_schema
 
 
-def _run_transaction(client: bigquery.Client, sql: str, job_config, attempts: int = 5) -> None:
-    """Run a multi-statement transaction, retrying if BigQuery aborts it
-    because another transaction committed against the same table first."""
-    for attempt in range(attempts):
-        try:
-            client.query(sql, job_config=job_config).result()
-            return
-        except Conflict:
-            if attempt == attempts - 1:
-                raise
-            time.sleep(random.uniform(0.2, 1.0) * (attempt + 1))
-
-
 def replace_day(table: str, date_column: str, day: dt.date, rows: list[dict]) -> str:
     client = bigquery.Client(project=PROJECT)
     table_id = f"{PROJECT}.raw.{table}"
     load_id = uuid.uuid4().hex
     loaded_at = dt.datetime.now(dt.timezone.utc).isoformat()
 
+    # A new source's table is created by its first load.
     try:
         existing = client.get_table(table_id).schema
-        table_exists = True
+        client.query(
+            f"DELETE FROM `{table_id}` WHERE {date_column} = @day",
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("day", "DATE", day)]
+            ),
+        ).result()
     except NotFound:
         existing = [
             bigquery.SchemaField("_load_id", "STRING"),
             bigquery.SchemaField("_loaded_at", "TIMESTAMP"),
         ]
-        table_exists = False
 
-    if not rows:
-        if table_exists:
-            _run_transaction(
-                client,
-                f"DELETE FROM `{table_id}` WHERE {date_column} = @day",
-                bigquery.QueryJobConfig(
-                    query_parameters=[bigquery.ScalarQueryParameter("day", "DATE", day)]
-                ),
-            )
-        print(f"{table} {day}: 0 rows, load {load_id}")
-        return load_id
-
-    typed, schema = _typed(rows, existing)
-    for row in typed:
-        row["_load_id"] = load_id
-        row["_loaded_at"] = loaded_at
-
-    if not table_exists:
-        # The very first load for a source creates the table; there is
-        # nothing else writing to it yet, so a plain append is safe.
+    if rows:
+        typed, schema = _typed(rows, existing)
+        for row in typed:
+            row["_load_id"] = load_id
+            row["_loaded_at"] = loaded_at
         client.load_table_from_json(
             typed,
             table_id,
@@ -130,45 +102,5 @@ def replace_day(table: str, date_column: str, day: dt.date, rows: list[dict]) ->
                 schema_update_options=["ALLOW_FIELD_ADDITION"],
             ),
         ).result()
-        print(f"{table} {day}: {len(rows)} rows, load {load_id}")
-        return load_id
-
-    # A vendor file can add columns. Add them to the real table up front so
-    # the transaction's INSERT can name every column.
-    existing_names = {f.name for f in existing}
-    for field in schema:
-        if field.name not in existing_names:
-            try:
-                client.query(
-                    f"ALTER TABLE `{table_id}` ADD COLUMN {field.name} {field.field_type}"
-                ).result()
-            except Conflict:
-                pass  # another concurrent load already added it
-
-    tmp_table_id = f"{PROJECT}.raw._tmp_{table}_{load_id}"
-    try:
-        client.load_table_from_json(
-            typed,
-            tmp_table_id,
-            job_config=bigquery.LoadJobConfig(schema=schema, write_disposition="WRITE_TRUNCATE"),
-        ).result()
-
-        columns = ", ".join(f.name for f in schema)
-        _run_transaction(
-            client,
-            f"""
-            BEGIN TRANSACTION;
-            DELETE FROM `{table_id}` WHERE {date_column} = @day;
-            INSERT INTO `{table_id}` ({columns})
-            SELECT {columns} FROM `{tmp_table_id}`;
-            COMMIT TRANSACTION;
-            """,
-            bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ScalarQueryParameter("day", "DATE", day)]
-            ),
-        )
-    finally:
-        client.delete_table(tmp_table_id, not_found_ok=True)
-
     print(f"{table} {day}: {len(rows)} rows, load {load_id}")
     return load_id
