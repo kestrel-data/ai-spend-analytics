@@ -10,10 +10,6 @@ sources:
         description: Microsoft 365 Copilot usage report, one row per day, user and app.
       - name: m365_copilot_seats
         description: Microsoft 365 Copilot licence assignments, $30 a seat a month.
-      - name: github_copilot_usage
-        description: GitHub Copilot usage, one row per day and GitHub login, pulled from the Kestrel Copilot API.
-      - name: github_copilot_seats
-        description: GitHub Copilot Business seat assignments, pulled fresh from the API on every load; $19 a seat a month. One snapshot per load day under `as_of`.
       - name: api_keys
         description: Which department owns each Azure OpenAI API key.
       - name: hr_employees
