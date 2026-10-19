@@ -19,6 +19,7 @@ select
   cast(null as int64) as acceptances_count,
   cast(null as int64) as lines_accepted,
   cast(null as int64) as chat_turns
+from (select 1)
 where false
 
 {% else %}

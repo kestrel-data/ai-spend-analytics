@@ -15,6 +15,7 @@ select
   cast(null as date) as created_at,
   cast(null as numeric) as monthly_cost_usd,
   cast(null as date) as as_of
+from (select 1)
 where false
 
 {% else %}
