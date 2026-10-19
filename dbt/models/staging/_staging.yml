@@ -6,7 +6,16 @@ models:
     columns:
       - name: usage_date
         description: Usage day, US Central.
-        tests: [not_null]
+        tests:
+          - not_null
+          - single_load_per_day:
+              config:
+                severity: warn
+                # Warn, not error, until DATA-109's Sept 17 reload lands (only
+                # reviewed code on main can trigger a reload). Put back to
+                # error in a follow-up PR once the reload is done and this
+                # passes clean.
+
       - name: api_key_id
         description: Azure OpenAI API key; owner in stg_api_keys.
         tests: [not_null]
@@ -29,7 +38,7 @@ models:
     columns:
       - name: day
         description: Usage day, US Central.
-        tests: [not_null]
+        tests: [not_null, single_load_per_day]
       - name: user_id
         description: HR employee id.
         tests: [not_null]
@@ -37,6 +46,10 @@ models:
         description: Microsoft 365 app the prompts were made in.
       - name: prompts
         description: Prompts sent that day.
+      - name: _load_id
+        description: The load that wrote this row.
+      - name: _loaded_at
+        description: When that load ran, UTC.
   - name: stg_m365_copilot_seats
     description: Microsoft 365 Copilot seats.
     columns:
